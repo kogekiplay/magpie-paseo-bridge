@@ -1,7 +1,5 @@
 # Magpie Paseo Bridge
 
-[简体中文](README.zh-CN.md)
-
 This Magpie request hook publishes the route that produced a Codex final reply. The Paseo Magpie plugin reads the local index to display the winning provider, served model, and fallback attempts next to that reply.
 
 ## Installation
@@ -11,7 +9,7 @@ Use Magpie and the Paseo daemon under the same OS user, with the same absolute `
 Run these commands on the Magpie host:
 
 ```sh
-magpie plugin add 'github:kogekiplay/magpie-paseo-bridge#v0.1.0'
+magpie plugin add 'github:kogekiplay/magpie-paseo-bridge#v0.1.1'
 magpie plugin list
 ```
 
