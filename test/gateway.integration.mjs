@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { execFile, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdir, mkdtemp, readFile, readdir, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { connect, createServer as createTCPServer } from "node:net";
 import { tmpdir } from "node:os";
@@ -83,6 +83,7 @@ test("local Magpie installs the hook and indexes actual Codex sessions", { timeo
   const gateway = await listen(reservation);
   await close(reservation);
   let websocketHandshakes = 0;
+  let paseoProcess;
   const proxyConnections = new Set();
   const proxy = createTCPServer((client) => {
     const peer = connect(Number(gateway.split(":")[1]), "127.0.0.1");
@@ -131,13 +132,14 @@ test("local Magpie installs the hook and indexes actual Codex sessions", { timeo
       response.writeHead(404).end();
       return;
     }
-    if (request.url.startsWith("/fail")) {
+    const input = Array.isArray(body.input) ? body.input : [];
+    const toolOutput = input.some((item) => item.type === "function_call_output");
+    if (request.url.startsWith("/fail") || (request.url.startsWith("/tool-first") && toolOutput)) {
       response.writeHead(429, { "content-type": "application/json" }).end(JSON.stringify({ error: { message: "fixture upstream error", type: "rate_limit_error" } }));
       return;
     }
     const id = upstreamRequests.length + 1;
-    const input = Array.isArray(body.input) ? body.input : [];
-    const needsTool = JSON.stringify(input).includes("fixture-use-tool") && !input.some((item) => item.type === "function_call_output");
+    const needsTool = JSON.stringify(input).includes("fixture-use-tool") && !toolOutput;
     const tool = body.tools?.find((item) => ["exec_command", "shell_command", "shell"].includes(item.name));
     const final = message(`msg_fixture_${id}`, "Fixture answer.");
     let output = [final];
@@ -147,7 +149,7 @@ test("local Magpie installs the hook and indexes actual Codex sessions", { timeo
         arguments: JSON.stringify(tool.name === "exec_command" ? { cmd: "printf fixture-tool-complete" } : { command: "printf fixture-tool-complete" }),
       }];
     }
-    upstreamRequests.push({ responseId: `resp_fixture_${id}`, messageId: output[0].id, needsTool, toolOutput: input.some((item) => item.type === "function_call_output"), tools: body.tools?.map(({ name, type }) => [name, type]) });
+    upstreamRequests.push({ responseId: `resp_fixture_${id}`, messageId: output[0].id, needsTool, toolOutput });
     sendResponses(response, `resp_fixture_${id}`, output, body.stream);
   });
   const upstreamAddr = await listen(upstream);
@@ -178,8 +180,10 @@ test("local Magpie installs the hook and indexes actual Codex sessions", { timeo
     assert.match((await magpieRun(["plugin", "list", "--json"])).stdout, /paseo-bridge\.hooks\.mjs/);
     await magpieRun(["provider", "add", "Fixture Native", "id=fixture-native", `responses=http://${upstreamAddr}/v1/responses`, "key=fixture-key", "models=fixture-model"]);
     await magpieRun(["provider", "add", "Fixture Fail", "id=fixture-fail", `responses=http://${upstreamAddr}/fail/v1/responses`, "key=fixture-key", "models=fixture-model"]);
+    await magpieRun(["provider", "add", "Tool First", "id=fixture-tool-first", `responses=http://${upstreamAddr}/tool-first/v1/responses`, "key=fixture-tool-key", "models=fixture-model"]);
     await magpieRun(["provider", "add", "Fixture Chat", "id=fixture-chat", `url=http://${upstreamAddr}/v1/chat/completions`, "key=fixture-key", "models=fixture-model"]);
     await magpieRun(["group", "add", "Fixture Group", "id=fixture-group", "models=fixture-fail/fixture-model,fixture-native/fixture-model", "routing=order"]);
+    await magpieRun(["group", "add", "Tool Group", "id=fixture-tool-group", "models=fixture-tool-first/fixture-model,fixture-native/fixture-model", "routing=order"]);
     gatewayProcess = spawn(magpie, ["serve"], { env, cwd: home, stdio: ["ignore", "ignore", "ignore"] });
     await waitFor(async () => (await fetch(`http://${gateway}/api/hello`).catch(() => null))?.ok, "isolated Magpie did not start");
 
@@ -213,24 +217,80 @@ test("local Magpie installs the hook and indexes actual Codex sessions", { timeo
       const session = await execCodex("fixture-normal", "fixture-group", false);
       assert.equal(websocketHandshakes, 0);
       const hit = upstreamRequests.at(-1);
-      const route = await waitFor(() => lookup(session, hit.messageId), "Codex HTTP route did not appear");
+      const { history, ...route } = await waitFor(() => lookup(session, hit.messageId), "Codex HTTP route did not appear");
+      assert.match(history?.turn ?? "", /^[a-f0-9]{64}$/);
       assert.deepEqual(route, { version: 1, provider: "fixture-native", model: "fixture-wire-v2", attempts: [
         { route: "fixture-fail/fixture-model", status: 429, failed: true },
         { route: "fixture-native/fixture-model", status: 200, failed: false },
       ] });
     });
 
-    await t.test("Codex WebSocket tool turn records the final message only", async () => {
+    async function readTurn(history) {
+      const files = (await readdir(index)).filter((name) => name.startsWith(`${history.turn}-`));
+      if (files.length < 2) return;
+      const records = await Promise.all(files.map((name) => readFile(join(index, name), "utf8").then(JSON.parse)));
+      return records.sort((a, b) => a.order.time - b.order.time || a.order.id - b.order.id);
+    }
+
+    await t.test("Codex WebSocket tool requests keep distinct routes in the same turn", async () => {
       const start = upstreamRequests.length;
-      const session = await execCodex("fixture-use-tool", "fixture-native/fixture-model", true);
+      const session = await execCodex("fixture-use-tool", "fixture-tool-group", true);
       assert.ok(websocketHandshakes > 0, "Codex did not connect over WebSocket");
       const turn = upstreamRequests.slice(start);
       assert.equal(turn.length, 2, JSON.stringify(turn));
       assert.equal(turn[0].needsTool, true);
       assert.equal(turn[1].toolOutput, true);
-      await waitFor(() => lookup(session, turn[1].messageId), "Codex WebSocket route did not appear");
+      const entry = await waitFor(() => lookup(session, turn[1].messageId), "Codex WebSocket route did not appear");
       assert.equal(await lookup(session, turn[0].messageId), undefined);
-      assert.equal((await readdir(index)).length, 2);
+      const requests = await waitFor(() => readTurn(entry.history), "tool and final request records did not appear");
+      assert.deepEqual(requests.map(({ phase, provider, model }) => [phase, provider, model]), [
+        ["tool", "fixture-tool-first", "fixture-wire-v2"], ["reply", "fixture-native", "fixture-wire-v2"],
+      ]);
+      assert.deepEqual(requests[1].attempts.map(({ status }) => status), [429, 200]);
+    });
+
+    const paseoPlugin = process.env.PASEO_PLUGIN_PATH;
+    await t.test("Paseo keeps the two Codex requests and their separate attempts under the final reply", { skip: !paseoPlugin }, async () => {
+      await magpieRun(["provider", "add", "Paseo Tool First", "id=fixture-paseo-first", `responses=http://${upstreamAddr}/tool-first/v1/responses`, "key=fixture-paseo-key", "models=fixture-model"]);
+      await magpieRun(["group", "add", "Paseo Tool Group", "id=fixture-paseo-group", "models=fixture-paseo-first/fixture-model,fixture-native/fixture-model", "routing=order"]);
+      const paseoHome = join(home, "paseo");
+      await mkdir(paseoHome);
+      await writeFile(join(paseoHome, "config.json"), JSON.stringify({ pluginsEnabled: true }));
+      await writeFile(join(codexHome, "config.toml"), `model_provider = "fixture"
+model = "fixture-paseo-group"
+model_reasoning_effort = "low"
+web_search = "disabled"
+[model_providers.fixture]
+name = "Fixture"
+base_url = "http://${codexGateway}/agent/codex/v1"
+wire_api = "responses"
+supports_websockets = true
+request_max_retries = 0
+stream_max_retries = 0
+`);
+      const listener = createServer();
+      const host = await listen(listener);
+      await close(listener);
+      const paseoEnv = {
+        ...env, PASEO_HOME: paseoHome, PASEO_LISTEN: host, PASEO_RELAY_ENABLED: "false",
+        PASEO_SERVICE_PROXY_ENABLED: "false", PASEO_MAGPIE_URL: `http://${gateway}`,
+      };
+      const cli = (args) => run("paseo", [...args, "--home", paseoHome, "--json"], { env: paseoEnv, cwd: home, timeout: 20_000 }).then(({ stdout }) => JSON.parse(stdout));
+      paseoProcess = spawn("paseo", ["daemon", "run", "--home", paseoHome], { env: paseoEnv, cwd: home, stdio: ["ignore", "ignore", "inherit"] });
+      await waitFor(async () => (await fetch(`http://${host}/api/health`).catch(() => null))?.ok, "isolated Paseo did not start");
+      await waitFor(() => cli(["plugin", "ls"]).catch(() => null), "isolated Paseo RPC did not start");
+      await cli(["plugin", "install", paseoPlugin]);
+      const agent = await cli(["agent", "run", "fixture-use-tool", "--provider", "codex", "--model", "fixture-paseo-group", "--mode", "full-access", "--cwd", home, "--no-wait"]);
+      const items = await waitFor(async () => {
+        const result = await cli(["agent", "logs", agent.agentId]);
+        return result.items?.some((item) => item.kind === "reply-route") ? result.items : undefined;
+      }, "Paseo did not append the reply route");
+      const rows = items.filter((item) => item.kind === "reply-route");
+      assert.equal(rows.length, 1);
+      assert.equal(items[items.indexOf(rows[0]) - 1].type, "assistant_message");
+      assert.deepEqual(rows[0].data.requests.map(({ provider, phase, attempts }) => [provider, phase, attempts.map(({ status }) => status)]), [
+        ["fixture-paseo-first", "tool", [200]], ["fixture-native", "reply", [429, 200]],
+      ]);
     });
 
     await t.test("translated Responses JSON uses the client-visible IDs", async () => {
@@ -251,6 +311,10 @@ test("local Magpie installs the hook and indexes actual Codex sessions", { timeo
       assert.equal(trace.routes.filter((entry) => entry.session === session && entry.responseId === id).length, 1);
     });
   } finally {
+    if (paseoProcess && paseoProcess.exitCode === null && paseoProcess.signalCode === null) {
+      paseoProcess.kill();
+      await new Promise((resolve) => paseoProcess.once("exit", resolve));
+    }
     for (const socket of proxyConnections) socket.destroy();
     await close(proxy);
     if (gatewayProcess && gatewayProcess.exitCode === null && gatewayProcess.signalCode === null) {
